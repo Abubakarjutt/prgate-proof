@@ -1,0 +1,148 @@
+# Stub gate for the prgate proof repo. Install at .github/workflows/pr-gate.yml.
+# Holds no real tool code: posts check `pr-gate` on the PR head SHA.
+#   - pull_request_target: failure if the head tree has a file named BAD (this wins
+#     over everything); else `neutral` if it has a file named NEUTRAL; else success.
+#     NEUTRAL exists ONLY in this proof stub, on purpose: it lets the agent obtain a
+#     `neutral` conclusion from the App so attack A11 can record whether GitHub treats
+#     neutral as passing. No other attack uses it. A real gate must never have it.
+#     A file named SILENT (and no BAD) makes the App post NOTHING. Also proof-stub-only:
+#     attack A15 uses it so the App is silent while the agent forges a status, a check
+#     and a green job named pr-gate; the PR must stay blocked. BAD beats SILENT.
+#   - issue_comment `/gate approve <sha>`: success only if ALL hold: first run
+#     attempt (no re-runs), PR open and based on the default branch, commenter is
+#     the account in repo variable PRGATE_APPROVER, commenter is not the PR author,
+#     and <sha> is the full 40-char lowercase SHA equal to the PR's current head.
+#     Short prefixes are refused.
+# pull_request_target on a PR not based on the default branch posts failure.
+# There is no checkout (PR code is never fetched or run), so persist-credentials
+# does not apply. The head tree is inspected through the API.
+# All event-derived values reach the shell via env:, never by expression
+# interpolation inside run blocks. Each run prints one `prgate-result run=<id> comment=<id|none>
+# result=<word>` line; the attack suite trusts only that line.
+name: pr-gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  verdict:
+    # Cheap pre-filter only; the script re-validates everything.
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/gate approve '))
+    runs-on: ubuntu-latest
+    environment: prgate-verdict
+    # Job level so comments failing the `if` never join a group; separate
+    # groups for verdict runs and approval runs.
+    concurrency:
+      group: pr-gate-${{ github.event_name == 'issue_comment' && 'approve' || 'verdict' }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      # actions/create-github-app-token v3.3.0
+      - name: Mint gate App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          app-id: ${{ secrets.PRGATE_APP_ID }}
+          private-key: ${{ secrets.PRGATE_APP_KEY }}
+
+      - name: Post pr-gate verdict
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          RUN_ID: ${{ github.run_id }}
+          APPROVER: ${{ vars.PRGATE_APPROVER }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          # Machine-readable outcome: ONE line tagged with this run and (for comment runs) the
+          # comment that triggered it. A PR comment cannot know either id in advance, so the
+          # attack suite relies on this line only, never on the human-readable messages.
+          result() { echo "prgate-result run=$RUN_ID comment=${COMMENT_ID:-none} result=$1"; }
+          stop() { echo "$2"; result "$1"; exit 0; } # $1=result word $2=human message
+
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "bad PR number"; result error; exit 1; }
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          head_sha=$(jq -r '.head.sha' <<<"$pr")
+          author=$(jq -r '.user.login' <<<"$pr")
+          state=$(jq -r '.state' <<<"$pr")
+          base_ref=$(jq -r '.base.ref' <<<"$pr")
+          lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head sha"; result error; exit 1; }
+
+          post() { # $1=conclusion $2=summary
+            gh api -X POST "repos/$REPO/check-runs" \
+              -f name=pr-gate -f head_sha="$head_sha" \
+              -f status=completed -f conclusion="$1" \
+              -f "output[title]=pr-gate $1" -f "output[summary]=$2" >/dev/null
+            echo "posted $1 on $head_sha"
+            result "posted-$1"
+          }
+
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            if [ "$EVENT_HEAD_SHA" != "$head_sha" ]; then
+              stop moved "head moved since event; a newer run will decide"
+            fi
+            if [ "$base_ref" != "$DEFAULT_BRANCH" ]; then
+              post failure "PR base is not the default branch"; exit 0
+            fi
+            # Success is posted ONLY after a positive check. Any failure to read or parse the
+            # tree, or a truncated tree, posts failure (never falls through to success).
+            if ! tree=$(gh api "repos/$REPO/git/trees/$head_sha?recursive=1"); then
+              post failure "Could not read the tree"; exit 0
+            fi
+            truncated=$(jq -r '.truncated' <<<"$tree") || truncated=error
+            if [ "$truncated" != "false" ]; then
+              post failure "Tree too large to inspect or unreadable"; exit 0
+            fi
+            # Marker precedence: BAD, then SILENT, then NEUTRAL; "plain" only after the array
+            # was walked successfully. A null path or non-array tree makes jq fail -> "error".
+            kind=$(jq -r '[.tree[] | select(.type=="blob") | (.path | split("/") | last)] as $n
+                | if ($n | index("BAD")) != null then "bad"
+                  elif ($n | index("SILENT")) != null then "silent"
+                  elif ($n | index("NEUTRAL")) != null then "neutral"
+                  else "plain" end' <<<"$tree") || kind=error
+            case "$kind" in
+              bad) post failure "A file named BAD is present" ;;
+              silent) stop posted-silent "SILENT marker present: posting no check" ;;
+              neutral) post neutral "A file named NEUTRAL is present (proof stub only, attack A11)" ;;
+              plain) post success "No file named BAD" ;;
+              *) post failure "Could not parse the tree" ;;
+            esac
+            exit 0
+          fi
+
+          # issue_comment: expect exactly `/gate approve <40-hex head sha>`
+          [ "$RUN_ATTEMPT" = "1" ] || stop refused-rerun "re-run refused"
+          [ "$state" = "open" ] || stop refused-not-open "PR not open"
+          [ "$base_ref" = "$DEFAULT_BRANCH" ] || stop refused-base "base is not default branch"
+          line=${COMMENT_BODY%%$'\n'*}
+          line=${line%$'\r'}
+          re='^/gate approve ([0-9a-f]{40})[[:space:]]*$'
+          [[ "$line" =~ $re ]] || stop refused-not-command "not an approve command"
+          want=${BASH_REMATCH[1]}
+          [ -n "$APPROVER" ] || stop refused-no-approver "PRGATE_APPROVER unset"
+          if [ "$(lc "$COMMENT_USER")" != "$(lc "$APPROVER")" ]; then
+            stop refused-commenter "commenter is not the approver"
+          fi
+          if [ "$(lc "$COMMENT_USER")" = "$(lc "$author")" ]; then
+            stop refused-author "approver is the PR author"
+          fi
+          if [ "$head_sha" != "$want" ]; then
+            stop refused-sha "sha is not the current head"
+          fi
+          post success "Approved by $APPROVER via /gate approve"
